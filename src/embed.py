@@ -64,8 +64,19 @@ class ArcFaceEmbedderONNX:
             )
 
     def _preprocess(self, aligned_bgr: np.ndarray) -> np.ndarray:
-        if aligned_bgr.shape[:2] != (self.in_h, self.in_w):
-            aligned_bgr = cv2.resize(aligned_bgr, (self.in_w, self.in_h))
+        # Check if the session expects a specific size (e.g. 640x640)
+        input_shape = self.sess.get_inputs()[0].shape
+        target_h, target_w = self.in_h, self.in_w
+        if len(input_shape) == 4:
+            if isinstance(input_shape[2], int) and input_shape[2] > 0:
+                target_h = input_shape[2]
+            if isinstance(input_shape[3], int) and input_shape[3] > 0:
+                target_w = input_shape[3]
+
+        if aligned_bgr.shape[:2] != (target_h, target_w):
+            aligned_bgr = cv2.resize(aligned_bgr, (target_w, target_h))
+
+        # Standard ArcFace preprocessing: RGB, then (x - 127.5) / 128.0
         rgb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
         rgb = (rgb - 127.5) / 128.0
         x = np.transpose(rgb, (2, 0, 1))[None, ...]
@@ -149,7 +160,7 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 # -------------------------
 def main():
     from .haar_5pt import Haar5ptDetector, align_face_5pt
-    
+
     cap = cv2.VideoCapture(0)
     det = Haar5ptDetector(
         min_size=(70, 70),

@@ -11,17 +11,25 @@ import numpy as np
 
 try:
     import mediapipe as mp
-except Exception as e:  # pragma: no cover
+    try:
+        from mediapipe.python.solutions import face_mesh as mp_face_mesh
+    except ImportError:
+        # Fallback for Python 3.13+ where solutions might be missing
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision as mp_vision
+        mp_face_mesh = None
+except Exception as e:
     mp = None
     _MP_IMPORT_ERROR = e
 
-from .recognize import (
+from src.recognize import (
     HaarFaceMesh5pt,
     ArcFaceEmbedderONNX,
     FaceDBMatcher,
     load_db_npz,
+    MatchResult,
 )
-from .haar_5pt import align_face_5pt
+from src.haar_5pt import align_face_5pt
 
 
 @dataclass
@@ -129,13 +137,29 @@ class FaceLocker:
         self.db_path = db_path
 
         # Landmarks model for action detection on locked ROI only
-        self.mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            refine_landmarks=True,
-            max_num_faces=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+        if mp_face_mesh is not None:
+            self.mesh = mp_face_mesh.FaceMesh(
+                static_image_mode=False,
+                refine_landmarks=True,
+                max_num_faces=1,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            self._use_tasks_api = False
+        else:
+            base_options = mp_python.BaseOptions(model_asset_path='models/face_landmarker.task')
+            options = mp_vision.FaceLandmarkerOptions(
+                base_options=base_options,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
+                num_faces=1,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+                running_mode=mp_vision.RunningMode.IMAGE
+            )
+            self.mesh = mp_vision.FaceLandmarker.create_from_options(options)
+            self._use_tasks_api = True
 
         # State
         self.state = "IDLE"  # or "LOCKED"
@@ -150,13 +174,18 @@ class FaceLocker:
         self.move_cooldown_s = 0.5
         self._last_move_t = 0.0
 
-        # Blink/Smile params
+        # Blink/Smile params (separate left/right eye blink)
         self.blink_thr = float(blink_thr)
         self.smile_thr = float(smile_thr)
         self.blink_cooldown_s = 0.6
         self.smile_cooldown_s = 0.8
-        self._last_blink_t = 0.0
+        self._last_blink_left_t = 0.0
+        self._last_blink_right_t = 0.0
         self._last_smile_t = 0.0
+
+        # On-screen action display for locked face (last N actions)
+        self._display_actions: List[str] = []
+        self._max_display_actions = 6
 
     def _choose_locked_face(self, candidates: List[FaceBox], W: int) -> Optional[FaceBox]:
         if not candidates or self.last_box is None:
@@ -186,13 +215,23 @@ class FaceLocker:
         if roi.size == 0 or roi.shape[0] < 10 or roi.shape[1] < 10:
             return []
         rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        try:
-            res = self.mesh.process(rgb)
-        except Exception:
-            return []
-        if not res.multi_face_landmarks:
-            return []
-        lm = res.multi_face_landmarks[0].landmark
+
+        if not self._use_tasks_api:
+            try:
+                res = self.mesh.process(rgb)
+            except Exception:
+                return []
+            if not res.multi_face_landmarks:
+                return []
+            lm = res.multi_face_landmarks[0].landmark
+        else:
+            # Tasks API
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            res = self.mesh.detect(mp_image)
+            if not res.face_landmarks:
+                return []
+            lm = res.face_landmarks[0]
+
         rh, rw = roi.shape[:2]
 
         def P(idx: int) -> np.ndarray:
@@ -210,7 +249,9 @@ class FaceLocker:
         R_c1, R_c2 = P(263), P(362)
         R_w = float(np.linalg.norm(R_c2 - R_c1) + 1e-6)
         R_h = float(np.linalg.norm(R_up - R_lo))
-        ear = 0.5 * ((L_h / L_w) + (R_h / R_w))
+        ear_left = L_h / L_w
+        ear_right = R_h / R_w
+        ear = 0.5 * (ear_left + ear_right)
 
         # Smile via MAR: inner lip 13/14 vs corners 61/291
         U, D = P(13), P(14)
@@ -219,9 +260,14 @@ class FaceLocker:
 
         now = time.time()
         actions: List[Tuple[str, str]] = []
-        if ear < self.blink_thr and (now - self._last_blink_t) >= self.blink_cooldown_s:
-            actions.append(("eye_blink", f"EAR={ear:.2f}"))
-            self._last_blink_t = now
+        # Left eye blink
+        if ear_left < self.blink_thr and (now - self._last_blink_left_t) >= self.blink_cooldown_s:
+            actions.append(("blink_left_eye", f"EAR_L={ear_left:.2f}"))
+            self._last_blink_left_t = now
+        # Right eye blink
+        if ear_right < self.blink_thr and (now - self._last_blink_right_t) >= self.blink_cooldown_s:
+            actions.append(("blink_right_eye", f"EAR_R={ear_right:.2f}"))
+            self._last_blink_right_t = now
         if mar > self.smile_thr and (now - self._last_smile_t) >= self.smile_cooldown_s:
             actions.append(("smile", f"MAR={mar:.2f}"))
             self._last_smile_t = now
@@ -252,8 +298,30 @@ class FaceLocker:
                 self.baseline_cx = 0.5 * (self.baseline_cx + cx)
             return None
 
+    @staticmethod
+    def _action_display_name(action_key: str) -> str:
+        """Map action key to human-readable label for on-screen display."""
+        names = {
+            "moved_left": "Move left",
+            "moved_right": "Move right",
+            "blink_left_eye": "Blink left eye",
+            "blink_right_eye": "Blink right eye",
+            "eye_blink": "Blink",
+            "smile": "Smiled",
+            "lock_acquired": "Lock acquired",
+            "lock_released": "Lock released",
+        }
+        return names.get(action_key, action_key.replace("_", " ").title())
+
+    def _add_display_action(self, action_key: str) -> None:
+        """Append action to on-screen list (for locked face only)."""
+        label = self._action_display_name(action_key)
+        self._display_actions.append(label)
+        if len(self._display_actions) > self._max_display_actions:
+            self._display_actions.pop(0)
+
     def run(self, default_window: str = "face_lock") -> None:
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(1)
         if not cap.isOpened():
             raise RuntimeError("Camera not available")
         print("Face Locking. q=quit, u=unlock, r=reload DB, +/- threshold")
@@ -272,6 +340,11 @@ class FaceLocker:
             # Convert detections to boxes list for tracking selection
             boxes = [self._to_box(f.x1, f.y1, f.x2, f.y2) for f in faces_det]
 
+            # Per-face recognition: store (box, MatchResult) for every face so we can label Unknown/name and LOCKED/UNLOCKED
+            per_face_results: List[Tuple[FaceBox, MatchResult]] = []
+            # Faces that match lock_name this frame (may be 0, 1, or more when multiple in frame)
+            lock_candidates: List[Tuple[int, FaceBox, MatchResult]] = []
+
             locked_idx: Optional[int] = None
             chosen_box: Optional[FaceBox] = None
             chosen_name: Optional[str] = None
@@ -279,7 +352,7 @@ class FaceLocker:
             chosen_dist = 1.0
             chosen_sim = 0.0
 
-            # Recognition for all faces, but we will pick one to lock/track
+            # Run recognition for every face; store result and collect lock candidates
             for i, f in enumerate(faces_det):
                 try:
                     aligned, _ = align_face_5pt(frame, f.kps, out_size=(112, 112))
@@ -288,42 +361,58 @@ class FaceLocker:
                 except Exception as e:
                     if self.debug:
                         print(f"[face_lock] Recognition error: {e}")
-                    continue
+                    mr = MatchResult(name=None, distance=1.0, similarity=0.0, accepted=False)
+                per_face_results.append((boxes[i], mr))
+                if mr.accepted and mr.name == self.lock_name:
+                    lock_candidates.append((i, boxes[i], mr))
 
-                # IDLE -> acquire lock when selected identity appears
-                if self.state == "IDLE" and mr.accepted and mr.name == self.lock_name:
+            # Decide which face is "locked" so it works with unknown + known + locked all in same frame
+            if self.state == "IDLE":
+                # Acquire lock when at least one face matches lock_name (e.g. only that person, or mixed frame)
+                if lock_candidates:
+                    # Pick best by similarity (highest sim = most confident match)
+                    best = max(lock_candidates, key=lambda t: t[2].similarity)
+                    i, box, mr = best
                     self.state = "LOCKED"
-                    chosen_box = boxes[i]
+                    chosen_box = box
                     chosen_name = mr.name
                     chosen_accepted = True
                     chosen_dist = mr.distance
                     chosen_sim = mr.similarity
+                    locked_idx = i
                     self.last_box = chosen_box
                     self.last_seen_time = time.time()
                     self.baseline_cx = chosen_box.center()[0]
                     if self.logger is None:
                         self.logger = ActionLogger(Path("data/history"), self.lock_name)
                     self.logger.log("lock_acquired", f"sim={mr.similarity:.3f} dist={mr.distance:.3f}")
-
-                # If already locked, try to update chosen box to the best matching spatial face
-                if self.state == "LOCKED":
-                    # select candidate by spatial continuity, but prefer if this face is the lock_name when recognized
-                    if mr.accepted and mr.name == self.lock_name:
-                        # Strong candidate: recognized as target
-                        cand = boxes[i]
-                        chosen_box = cand
-                        chosen_name = mr.name
-                        chosen_accepted = True
-                        chosen_dist = mr.distance
-                        chosen_sim = mr.similarity
-                        locked_idx = i
-
-            # If locked but not recognized in this frame or we didn't see it during recognition loop,
-            # choose by spatial continuity among boxes
-            if self.state == "LOCKED" and (chosen_box is None) and boxes:
-                cb = self._choose_locked_face(boxes, W)
-                if cb is not None:
-                    chosen_box = cb
+                    self._add_display_action("lock_acquired")
+            elif self.state == "LOCKED":
+                if lock_candidates:
+                    # Multiple faces may match lock_name; pick the one with best spatial continuity to last_box
+                    if self.last_box is not None:
+                        best = max(
+                            lock_candidates,
+                            key=lambda t: _iou(t[1], self.last_box),
+                        )
+                    else:
+                        best = max(lock_candidates, key=lambda t: t[2].similarity)
+                    i, box, mr = best
+                    chosen_box = box
+                    chosen_name = mr.name
+                    chosen_accepted = True
+                    chosen_dist = mr.distance
+                    chosen_sim = mr.similarity
+                    locked_idx = i
+                else:
+                    # No face recognized as lock_name this frame; track by position (spatial continuity)
+                    cb = self._choose_locked_face(boxes, W)
+                    if cb is not None:
+                        chosen_box = cb
+                        for i, b in enumerate(boxes):
+                            if b.x1 == cb.x1 and b.y1 == cb.y1 and b.x2 == cb.x2 and b.y2 == cb.y2:
+                                locked_idx = i
+                                break
 
             # State maintenance
             now = time.time()
@@ -334,23 +423,46 @@ class FaceLocker:
                 else:
                     # no plausible box this frame
                     if (now - self.last_seen_time) >= self.unlock_timeout_s:
-                        # auto-unlock
                         if self.logger is not None:
                             self.logger.log("lock_released", "timeout")
+                        self._add_display_action("lock_released")
                         self.state = "IDLE"
                         self.last_box = None
                         self.baseline_cx = None
 
-            # Draw and actions
-            for i, f in enumerate(faces_det):
-                c = (0, 0, 255)
-                thick = 2
-                if self.state == "LOCKED" and self.last_box is not None:
-                    lb = self.last_box
-                    if f.x1 == lb.x1 and f.y1 == lb.y1 and f.x2 == lb.x2 and f.y2 == lb.y2:
-                        c = (0, 255, 0)
-                        thick = 3
-                cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), c, thick)
+            # Draw every face with label (Unknown / name), status (LOCKED / UNLOCKED), and corresponding data
+            for i, (box, mr) in enumerate(per_face_results):
+                is_locked = (
+                    self.state == "LOCKED"
+                    and chosen_box is not None
+                    and box.x1 == chosen_box.x1
+                    and box.y1 == chosen_box.y1
+                    and box.x2 == chosen_box.x2
+                    and box.y2 == chosen_box.y2
+                )
+                # Colors: green = locked, cyan = known unlocked, red = unknown
+                if is_locked:
+                    c = (0, 255, 0)
+                    thick = 3
+                elif mr.accepted:
+                    c = (255, 200, 0)  # cyan-ish (BGR)
+                    thick = 2
+                else:
+                    c = (0, 0, 255)  # red = unknown
+                    thick = 2
+                cv2.rectangle(vis, (box.x1, box.y1), (box.x2, box.y2), c, thick)
+
+                # Label: name or "Unknown", then status (LOCKED/UNLOCKED), then data (dist/sim)
+                display_name = self.lock_name if is_locked else (mr.name if mr.accepted else "Unknown")
+                status = "LOCKED" if is_locked else "UNLOCKED"
+                data_str = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}"
+
+                line1_y = max(24, box.y1 - 4)   # name (just above box)
+                line2_y = max(2, line1_y - 22)  # status
+                line3_y = max(2, line2_y - 20)  # data
+                cv2.putText(vis, display_name, (box.x1, line1_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, c, 2)
+                cv2.putText(vis, status, (box.x1, line2_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
+                cv2.putText(vis, data_str, (box.x1, line3_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 2)
 
             header = f"IDs={len(self.matcher._names)} thr={self.matcher.dist_thresh:.2f}"
             if fps is not None:
@@ -358,27 +470,28 @@ class FaceLocker:
             header += f" Locked={'None' if self.state=='IDLE' else self.lock_name}"
             cv2.putText(vis, header, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
 
-            # Action detection & UI label for locked box
+            # Action detection for locked face + on-screen action display
             if self.state == "LOCKED" and self.last_box is not None:
                 lb = self.last_box
-                cv2.putText(
-                    vis,
-                    f"LOCKED: {self.lock_name}",
-                    (lb.x1, max(0, lb.y1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 0),
-                    2,
-                )
                 # Movement
                 mv = self._movement_action(lb, W)
                 if mv and self.logger is not None:
                     self.logger.log(mv[0], mv[1])
-                # Blink & Smile
+                    self._add_display_action(mv[0])
+                # Blink (left/right) & Smile
                 acts = self._detect_actions(frame, lb)
                 for act, desc in acts:
                     if self.logger is not None:
                         self.logger.log(act, desc)
+                    self._add_display_action(act)
+
+                # Draw "Actions:" panel with last actions (Move left, Blink left eye, Smiled, etc.)
+                action_y = 58
+                cv2.putText(vis, "Actions:", (10, action_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                action_y += 24
+                for line in self._display_actions[-5:]:  # last 5 actions
+                    cv2.putText(vis, f"  {line}", (10, action_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    action_y += 22
 
             # FPS bookkeeping
             frames += 1
@@ -396,6 +509,7 @@ class FaceLocker:
                 if self.state == "LOCKED":
                     if self.logger is not None:
                         self.logger.log("lock_released", "manual")
+                    self._add_display_action("lock_released")
                 self.state = "IDLE"
                 self.last_box = None
                 self.baseline_cx = None

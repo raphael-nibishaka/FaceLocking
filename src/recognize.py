@@ -34,7 +34,7 @@ except Exception as e:
     mp = None
     _MP_IMPORT_ERROR = e
 
-from .haar_5pt import align_face_5pt
+from src.haar_5pt import align_face_5pt
 
 
 # -------------------------
@@ -222,13 +222,34 @@ class HaarFaceMesh5pt:
                 f"mediapipe import failed: {_MP_IMPORT_ERROR}\n"
                 f"Install: pip install mediapipe==0.10.21"
             )
-        self.mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+
+        try:
+            from mediapipe.python.solutions import face_mesh as mp_face_mesh
+            self.mesh = mp_face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            self._use_tasks_api = False
+        except ImportError:
+            # Fallback for Python 3.13+ where solutions might be missing
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision as mp_vision
+            base_options = mp_python.BaseOptions(model_asset_path='models/face_landmarker.task')
+            options = mp_vision.FaceLandmarkerOptions(
+                base_options=base_options,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
+                num_faces=1,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+                running_mode=mp_vision.RunningMode.IMAGE
+            )
+            self.mesh = mp_vision.FaceLandmarker.create_from_options(options)
+            self._use_tasks_api = True
         self.IDX_LEFT_EYE = 33
         self.IDX_RIGHT_EYE = 263
         self.IDX_NOSE_TIP = 1
@@ -252,10 +273,20 @@ class HaarFaceMesh5pt:
         if H < 20 or W < 20:
             return None
         rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
-        res = self.mesh.process(rgb)
-        if not res.multi_face_landmarks:
-            return None
-        lm = res.multi_face_landmarks[0].landmark
+
+        if not self._use_tasks_api:
+            res = self.mesh.process(rgb)
+            if not res.multi_face_landmarks:
+                return None
+            lm = res.multi_face_landmarks[0].landmark
+        else:
+            # Tasks API
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            res = self.mesh.detect(mp_image)
+            if not res.face_landmarks:
+                return None
+            lm = res.face_landmarks[0]
+
         idxs = [
             self.IDX_LEFT_EYE,
             self.IDX_RIGHT_EYE,

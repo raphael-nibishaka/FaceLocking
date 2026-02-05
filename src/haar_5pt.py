@@ -22,6 +22,13 @@ import numpy as np
 
 try:
     import mediapipe as mp
+    try:
+        from mediapipe.python.solutions import face_mesh as mp_face_mesh
+    except ImportError:
+        # Fallback for Python 3.13+ where solutions might be missing
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision as mp_vision
+        mp_face_mesh = None
 except Exception as e:
     mp = None
     _MP_IMPORT_ERROR = e
@@ -174,13 +181,32 @@ class Haar5ptDetector:
                 "Install: pip install mediapipe==0.10.21"
             )
 
-        self.mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+        if mp_face_mesh is not None:
+            self.mp_face_mesh = mp_face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            self._use_tasks_api = False
+        else:
+            # Python 3.13+ Tasks API Fallback
+            # We need a model file for this. For now, we'll try to initialize it.
+            # Note: This requires face_landmarker.task in the models folder.
+            base_options = mp_python.BaseOptions(model_asset_path='models/face_landmarker.task')
+            options = mp_vision.FaceLandmarkerOptions(
+                base_options=base_options,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
+                num_faces=1,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+                running_mode=mp_vision.RunningMode.IMAGE
+            )
+            self.mp_face_mesh = mp_vision.FaceLandmarker.create_from_options(options)
+            self._use_tasks_api = True
 
         # FaceMesh landmark indices for 5 points
         self.IDX_LEFT_EYE = 33
@@ -207,11 +233,20 @@ class Haar5ptDetector:
     def _facemesh_5pt(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
         H, W = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        res = self.mp_face_mesh.process(rgb)
-        if not res.multi_face_landmarks:
-            return None
 
-        lm = res.multi_face_landmarks[0].landmark
+        if not self._use_tasks_api:
+            res = self.mp_face_mesh.process(rgb)
+            if not res.multi_face_landmarks:
+                return None
+            lm = res.multi_face_landmarks[0].landmark
+        else:
+            # Tasks API
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            res = self.mp_face_mesh.detect(mp_image)
+            if not res.face_landmarks:
+                return None
+            lm = res.face_landmarks[0]
+
         idxs = [
             self.IDX_LEFT_EYE,
             self.IDX_RIGHT_EYE,
@@ -295,7 +330,7 @@ class Haar5ptDetector:
 # -------------------------
 
 def main():
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(1)
     det = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=True)
 
     print("Haar + 5pt (FaceMesh) test. Press q to quit.")
