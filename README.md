@@ -20,6 +20,7 @@
 12. [Interactive Controls](#12-interactive-controls)
 13. [Enrollment Workflow](#13-enrollment-workflow)
 14. [Technical Notes](#14-technical-notes)
+15. [Distributed Vision-Control System](#15-distributed-vision-control-system)
 
 ---
 
@@ -244,11 +245,23 @@ Then move your head left/right, blink, or smile while your face is locked to see
 | `--smile-thr` | float | `0.60` | MAR threshold for smile detection. |
 | `--dist-thr` | float | `0.62` | Cosine distance threshold for accepting a match (lower = stricter). |
 | `--camera` | int | `1` | Camera index (use **`list_cameras.py`** to find indices). |
+| `--team-id` | str | `"creation_squad"` | Team identifier for MQTT topic isolation. |
+| `--mqtt-broker` | str | `"157.173.101.159"` | MQTT broker hostname/IP (VPS). |
+| `--mqtt-port` | int | `1883` | MQTT broker port. |
+| `--team-id` | str | `"creation_squad"` | Team identifier for MQTT topic isolation. |
+| `--mqtt-broker` | str | `"157.173.101.159"` | MQTT broker hostname/IP (VPS address). |
+| `--mqtt-port` | int | `1883` | MQTT broker port. |
 
 Example with custom timeout and camera:
 
 ```bash
 python face_lock.py --lock-name "Raphael" --unlock-timeout 3.0 --camera 0
+```
+
+Example with MQTT enabled (distributed vision-control):
+
+```bash
+python face_lock.py --lock-name "Raphael" --team-id creation_squad --mqtt-broker 157.173.101.159
 ```
 
 ---

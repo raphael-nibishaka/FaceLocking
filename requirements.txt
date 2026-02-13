@@ -1,0 +1,13 @@
+# Face Locking System - Python Dependencies
+
+# Core vision libraries
+opencv-python>=4.5.0
+numpy>=1.21.0
+onnxruntime>=1.10.0
+mediapipe==0.10.21
+
+# MQTT support (for distributed vision-control)
+paho-mqtt>=1.6.0
+
+# WebSocket support (for backend bridge)
+websockets>=10.0

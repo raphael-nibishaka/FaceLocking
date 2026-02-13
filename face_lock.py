@@ -1,6 +1,7 @@
 # src/face_lock.py
 from __future__ import annotations
 import argparse
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,13 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+try:
+    import paho.mqtt.client as mqtt
+    MQTT_AVAILABLE = True
+except ImportError:
+    MQTT_AVAILABLE = False
+    print("[WARNING] paho-mqtt not installed. MQTT publishing disabled. Install: pip install paho-mqtt")
 
 try:
     import mediapipe as mp
@@ -115,6 +123,9 @@ class FaceLocker:
         blink_thr: float = 0.20,
         smile_thr: float = 0.60,
         debug: bool = False,
+        team_id: Optional[str] = None,
+        mqtt_broker: Optional[str] = None,
+        mqtt_port: int = 1883,
     ):
         if mp is None:
             raise RuntimeError(
@@ -186,6 +197,27 @@ class FaceLocker:
         # On-screen action display for locked face (last N actions)
         self._display_actions: List[str] = []
         self._max_display_actions = 6
+
+        # MQTT setup for distributed vision-control
+        self.team_id = team_id
+        self.mqtt_client: Optional[mqtt.Client] = None
+        self.mqtt_topic_movement: Optional[str] = None
+        self._last_movement_state: Optional[str] = None
+        self._center_threshold_frac = 0.10  # 10% of frame width for "centered" zone
+        
+        if team_id and mqtt_broker and MQTT_AVAILABLE:
+            self.mqtt_topic_movement = f"vision/{team_id}/movement"
+            try:
+                self.mqtt_client = mqtt.Client(client_id=f"face_lock_{team_id}")
+                self.mqtt_client.connect(mqtt_broker, mqtt_port, keepalive=60)
+                self.mqtt_client.loop_start()
+                print(f"[MQTT] Connected to {mqtt_broker}:{mqtt_port}, topic: {self.mqtt_topic_movement}")
+            except Exception as e:
+                print(f"[MQTT] Failed to connect: {e}")
+                self.mqtt_client = None
+        elif team_id or mqtt_broker:
+            if not MQTT_AVAILABLE:
+                print("[MQTT] paho-mqtt not installed. Install: pip install paho-mqtt")
 
     def _choose_locked_face(self, candidates: List[FaceBox], W: int) -> Optional[FaceBox]:
         if not candidates or self.last_box is None:
@@ -320,8 +352,55 @@ class FaceLocker:
         if len(self._display_actions) > self._max_display_actions:
             self._display_actions.pop(0)
 
-    def run(self, default_window: str = "face_lock") -> None:
-        cap = cv2.VideoCapture(1)
+    def _determine_movement_state(self, box: Optional[FaceBox], W: int) -> Tuple[str, float]:
+        """
+        Determine movement state for MQTT publishing.
+        Returns: (status, confidence)
+        status: "MOVE_LEFT", "MOVE_RIGHT", "CENTERED", "NO_FACE"
+        """
+        if box is None:
+            return ("NO_FACE", 0.0)
+        
+        cx, _ = box.center()
+        frame_center = W / 2.0
+        offset = cx - frame_center
+        threshold = self._center_threshold_frac * W
+        
+        if abs(offset) <= threshold:
+            confidence = 1.0 - (abs(offset) / threshold) if threshold > 0 else 1.0
+            return ("CENTERED", confidence)
+        elif offset < 0:
+            # Face is left of center
+            confidence = min(1.0, abs(offset) / (W * 0.3))  # normalize to max 30% of frame
+            return ("MOVE_LEFT", confidence)
+        else:
+            # Face is right of center
+            confidence = min(1.0, abs(offset) / (W * 0.3))
+            return ("MOVE_RIGHT", confidence)
+
+    def _publish_movement(self, status: str, confidence: float) -> None:
+        """Publish movement state to MQTT."""
+        if self.mqtt_client is None or self.mqtt_topic_movement is None:
+            return
+        
+        payload = {
+            "status": status,
+            "confidence": round(confidence, 3),
+            "timestamp": int(time.time())
+        }
+        try:
+            self.mqtt_client.publish(
+                self.mqtt_topic_movement,
+                json.dumps(payload),
+                qos=1,
+                retain=False
+            )
+        except Exception as e:
+            if self.debug:
+                print(f"[MQTT] Publish error: {e}")
+
+    def run(self, camera_index: int = 1, default_window: str = "face_lock") -> None:
+        cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
             raise RuntimeError("Camera not available")
         print("Face Locking. q=quit, u=unlock, r=reload DB, +/- threshold")
@@ -470,7 +549,7 @@ class FaceLocker:
             header += f" Locked={'None' if self.state=='IDLE' else self.lock_name}"
             cv2.putText(vis, header, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
 
-            # Action detection for locked face + on-screen action display
+            # Action detection for locked face + on-screen action display + MQTT publishing
             if self.state == "LOCKED" and self.last_box is not None:
                 lb = self.last_box
                 # Movement
@@ -485,6 +564,12 @@ class FaceLocker:
                         self.logger.log(act, desc)
                     self._add_display_action(act)
 
+                # Determine and publish movement state for MQTT
+                movement_status, confidence = self._determine_movement_state(lb, W)
+                if movement_status != self._last_movement_state:
+                    self._publish_movement(movement_status, confidence)
+                    self._last_movement_state = movement_status
+
                 # Draw "Actions:" panel with last actions (Move left, Blink left eye, Smiled, etc.)
                 action_y = 58
                 cv2.putText(vis, "Actions:", (10, action_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
@@ -492,6 +577,13 @@ class FaceLocker:
                 for line in self._display_actions[-5:]:  # last 5 actions
                     cv2.putText(vis, f"  {line}", (10, action_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                     action_y += 22
+            else:
+                # No face locked: publish NO_FACE
+                if self.state == "IDLE":
+                    movement_status = "NO_FACE"
+                    if movement_status != self._last_movement_state:
+                        self._publish_movement(movement_status, 0.0)
+                        self._last_movement_state = movement_status
 
             # FPS bookkeeping
             frames += 1
@@ -529,6 +621,16 @@ class FaceLocker:
 
         cap.release()
         cv2.destroyAllWindows()
+        # Cleanup MQTT
+        if self.mqtt_client is not None:
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
+            print("[MQTT] Disconnected")
+        # Cleanup MQTT
+        if self.mqtt_client is not None:
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
+            print("[MQTT] Disconnected")
 
 
 def _select_lock_name_from_db(default: str, db: dict) -> str:
@@ -556,12 +658,16 @@ def _select_lock_name_from_db(default: str, db: dict) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Face Locking with action history")
+    p = argparse.ArgumentParser(description="Face Locking with action history and MQTT publishing")
     p.add_argument("--lock-name", type=str, default="Joyeuse", help="Identity to lock")
     p.add_argument("--unlock-timeout", type=float, default=2.5, help="Seconds to auto-unlock after disappearance")
     p.add_argument("--blink-thr", type=float, default=0.20, help="EAR threshold for blink detection")
     p.add_argument("--smile-thr", type=float, default=0.60, help="MAR threshold for smile detection")
     p.add_argument("--dist-thr", type=float, default=0.62, help="Matcher distance threshold")
+    p.add_argument("--team-id", type=str, default="creation_squad", help="Team identifier for MQTT topic isolation (default: creation_squad)")
+    p.add_argument("--mqtt-broker", type=str, default="157.173.101.159", help="MQTT broker hostname/IP (default: 157.173.101.159)")
+    p.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port (default: 1883)")
+    p.add_argument("--camera", type=int, default=1, help="Camera index (use list_cameras.py to find indices)")
     return p.parse_args()
 
 
@@ -576,8 +682,11 @@ def main():
         blink_thr=args.blink_thr,
         smile_thr=args.smile_thr,
         debug=False,
+        team_id=args.team_id,
+        mqtt_broker=args.mqtt_broker,
+        mqtt_port=args.mqtt_port,
     )
-    fl.run()
+    fl.run(camera_index=args.camera)
 
 
 if __name__ == "__main__":

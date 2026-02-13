@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face-Locked Servo Control Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            padding: 40px;
+            max-width: 600px;
+            width: 100%;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 2em;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 0.9em;
+        }
+
+        .status-card {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 20px;
+            border-left: 5px solid #667eea;
+        }
+
+        .status-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .status-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .label {
+            font-weight: 600;
+            color: #555;
+            font-size: 0.95em;
+        }
+
+        .value {
+            font-size: 1.1em;
+            font-weight: 700;
+            color: #333;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 0.9em;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .status-MOVE_LEFT {
+            background: #ff6b6b;
+            color: white;
+        }
+
+        .status-MOVE_RIGHT {
+            background: #4ecdc4;
+            color: white;
+        }
+
+        .status-CENTERED {
+            background: #95e1d3;
+            color: #333;
+        }
+
+        .status-NO_FACE {
+            background: #ffd93d;
+            color: #333;
+        }
+
+        .status-DISCONNECTED {
+            background: #999;
+            color: white;
+        }
+
+        .connection-status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .connection-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #999;
+            animation: pulse 2s infinite;
+        }
+
+        .connection-dot.connected {
+            background: #51cf66;
+        }
+
+        .connection-dot.disconnected {
+            background: #ff6b6b;
+            animation: none;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .timestamp {
+            color: #888;
+            font-size: 0.85em;
+            font-family: 'Courier New', monospace;
+        }
+
+        .confidence-bar {
+            width: 100%;
+            height: 8px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 5px;
+        }
+
+        .confidence-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            transition: width 0.3s ease;
+        }
+
+        .instructions {
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 20px;
+            font-size: 0.9em;
+            color: #856404;
+        }
+
+        .instructions h3 {
+            margin-bottom: 10px;
+            color: #856404;
+        }
+
+        .instructions ul {
+            margin-left: 20px;
+        }
+
+        .instructions li {
+            margin-bottom: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎯 Face-Locked Servo Control</h1>
+        <p class="subtitle">Real-time tracking dashboard</p>
+
+        <div class="connection-status">
+            <div class="connection-dot disconnected" id="connectionDot"></div>
+            <span id="connectionStatus">Disconnected</span>
+        </div>
+
+        <div class="status-card">
+            <div class="status-row">
+                <span class="label">Movement Status:</span>
+                <span class="status-badge status-DISCONNECTED" id="movementStatus">DISCONNECTED</span>
+            </div>
+            <div class="status-row">
+                <span class="label">Confidence:</span>
+                <span class="value" id="confidence">0.000</span>
+            </div>
+            <div class="confidence-bar">
+                <div class="confidence-fill" id="confidenceBar" style="width: 0%"></div>
+            </div>
+            <div class="status-row" style="margin-top: 15px;">
+                <span class="label">Last Update:</span>
+                <span class="timestamp" id="timestamp">--</span>
+            </div>
+        </div>
+
+        <div class="instructions">
+            <h3>📋 Instructions</h3>
+            <ul>
+                <li>Make sure the backend service is running</li>
+                <li>Update the WebSocket URL below if needed</li>
+                <li>Move your face left/right to see real-time updates</li>
+                <li>The servo motor will follow your face movement</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const WS_URL = 'ws://157.173.101.159:9002';  // VPS WebSocket server
+        // For local testing: const WS_URL = 'ws://localhost:9002';
+
+        // DOM elements
+        const connectionDot = document.getElementById('connectionDot');
+        const connectionStatus = document.getElementById('connectionStatus');
+        const movementStatus = document.getElementById('movementStatus');
+        const confidence = document.getElementById('confidence');
+        const confidenceBar = document.getElementById('confidenceBar');
+        const timestamp = document.getElementById('timestamp');
+
+        let ws = null;
+        let reconnectTimeout = null;
+
+        function updateConnectionStatus(connected) {
+            if (connected) {
+                connectionDot.classList.remove('disconnected');
+                connectionDot.classList.add('connected');
+                connectionStatus.textContent = 'Connected';
+            } else {
+                connectionDot.classList.remove('connected');
+                connectionDot.classList.add('disconnected');
+                connectionStatus.textContent = 'Disconnected';
+            }
+        }
+
+        function updateMovementData(data) {
+            const status = data.status || 'NO_FACE';
+            const conf = data.confidence || 0.0;
+            const ts = data.timestamp || Date.now() / 1000;
+
+            // Update status badge
+            movementStatus.textContent = status;
+            movementStatus.className = `status-badge status-${status}`;
+
+            // Update confidence
+            confidence.textContent = conf.toFixed(3);
+            confidenceBar.style.width = `${conf * 100}%`;
+
+            // Update timestamp
+            const date = new Date(ts * 1000);
+            timestamp.textContent = date.toLocaleTimeString() + '.' + 
+                Math.floor((ts % 1) * 1000).toString().padStart(3, '0');
+        }
+
+        function connect() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                return;
+            }
+
+            console.log(`Connecting to ${WS_URL}...`);
+            ws = new WebSocket(WS_URL);
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                updateConnectionStatus(true);
+                if (reconnectTimeout) {
+                    clearTimeout(reconnectTimeout);
+                    reconnectTimeout = null;
+                }
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    console.log('Received:', message);
+
+                    if (message.type === 'welcome') {
+                        console.log('Welcome message:', message);
+                    } else if (message.type === 'movement') {
+                        updateMovementData(message.data);
+                    }
+                } catch (e) {
+                    console.error('Error parsing message:', e);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                updateConnectionStatus(false);
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket closed');
+                updateConnectionStatus(false);
+                movementStatus.textContent = 'DISCONNECTED';
+                movementStatus.className = 'status-badge status-DISCONNECTED';
+                
+                // Reconnect after 3 seconds
+                reconnectTimeout = setTimeout(connect, 3000);
+            };
+        }
+
+        // Initial connection
+        connect();
+
+        // Handle page visibility (reconnect when tab becomes visible)
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden && (!ws || ws.readyState !== WebSocket.OPEN)) {
+                connect();
+            }
+        });
+    </script>
+</body>
+</html>
