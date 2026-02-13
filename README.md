@@ -301,6 +301,10 @@ Capture multiple angles and expressions (e.g. 15+ samples per person) for better
 
 ---
 
+## 🔌 Wiring Diagram
+
+![Wiring Diagram](wiring.png)
+
 ## 14. Technical Notes
 
 - **Distance vs similarity:** Embeddings are L2-normalized; **cosine similarity = dot(a, b)**. The matcher uses **cosine distance = 1 - similarity**. A lower **dist_thr** means stricter matching.
