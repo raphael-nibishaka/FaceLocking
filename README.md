@@ -1,3 +1,8 @@
+## 🔌 Wiring Diagram
+
+![Wiring Diagram](wiring.png)
+
+
 # Face Locking System — Intelligent Vision Feature
 
 **Repository:** [https://github.com/raphael-nibishaka/FaceLocking](https://github.com/raphael-nibishaka/FaceLocking)
